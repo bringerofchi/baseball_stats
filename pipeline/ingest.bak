@@ -1,0 +1,526 @@
+"""
+Step 1 & 2: Data ingestion + storage.
+
+Pulls games, starting pitchers, weather, and odds for a given date and
+upserts them into the database. Designed to be run once daily (opening
+snapshot) and again close to first pitch (closing snapshot) so the odds
+table gets both opening_* and closing_* fields populated.
+
+Usage:
+    python -m pipeline.ingest --date 2026-07-06 --snapshot opening
+    python -m pipeline.ingest --date 2026-07-06 --snapshot closing
+"""
+import argparse
+import sys
+from datetime import date as _date
+
+sys.path.append(".")  # allow running as a script from project root
+
+import requests
+
+import config
+from clients.mlb_stats_api import MLBStatsAPIClient
+from clients.odds_api import OddsAPIClient
+from clients.parlay_api import ParlayAPIClient
+from clients.sharpapi import SharpAPIClient
+from clients.weather import WeatherClient
+from clients.name_utils import normalize_name
+from db.database import connection, upsert, init_db
+
+
+# Full 30-team mapping: The Odds API full name -> SportsDataIO short code.
+# SportsDataIO codes verified against their MLB team reference as of this
+# writing. One live caveat: the Athletics relocated to Sacramento for the
+# 2025-2027 seasons and play under just "Athletics" (no city) in most feeds
+# — both "Oakland Athletics" and "Athletics" are mapped below to the same
+# code, but if either API renames the club differently, that entry is the
+# one to fix first.
+_TEAM_NAME_TO_CODE = {
+    "Arizona Diamondbacks": "ARI",
+    "Atlanta Braves": "ATL",
+    "Baltimore Orioles": "BAL",
+    "Boston Red Sox": "BOS",
+    "Chicago Cubs": "CHC",
+    "Chicago White Sox": "CWS",
+    "Cincinnati Reds": "CIN",
+    "Cleveland Guardians": "CLE",
+    "Colorado Rockies": "COL",
+    "Detroit Tigers": "DET",
+    "Houston Astros": "HOU",
+    "Kansas City Royals": "KC",
+    "Los Angeles Angels": "LAA",
+    "Los Angeles Dodgers": "LAD",
+    "Miami Marlins": "MIA",
+    "Milwaukee Brewers": "MIL",
+    "Minnesota Twins": "MIN",
+    "New York Mets": "NYM",
+    "New York Yankees": "NYY",
+    "Oakland Athletics": "OAK",
+    "Athletics": "OAK",
+    "Philadelphia Phillies": "PHI",
+    "Pittsburgh Pirates": "PIT",
+    "San Diego Padres": "SD",
+    "San Francisco Giants": "SF",
+    "Seattle Mariners": "SEA",
+    "St. Louis Cardinals": "STL",
+    "St Louis Cardinals": "STL",  # accent/period variants some feeds use
+    "Tampa Bay Rays": "TB",
+    "Texas Rangers": "TEX",
+    "Toronto Blue Jays": "TOR",
+    "Washington Nationals": "WSH",
+}
+
+# Fallback: match by the last word of the team name (nickname) if the exact
+# full-name match above misses — catches naming-convention drift between
+# providers (e.g. "St. Louis" vs "St Louis", abbreviation changes) without
+# needing an exact-string update every time a provider tweaks formatting.
+_NICKNAME_TO_CODE = {name.split()[-1]: code for name, code in _TEAM_NAME_TO_CODE.items()}
+
+
+def _team_to_code(full_name: str) -> str:
+    """Maps a full team name (as returned by The Odds API) to the short
+    code SportsDataIO/our `games` table uses. Falls back to nickname
+    matching, then returns the input unchanged (with a warning) if nothing
+    matches — better to surface a visible mismatch than silently drop the
+    odds row."""
+    if full_name in _TEAM_NAME_TO_CODE:
+        return _TEAM_NAME_TO_CODE[full_name]
+    nickname = full_name.split()[-1]
+    if nickname in _NICKNAME_TO_CODE:
+        return _NICKNAME_TO_CODE[nickname]
+    print(f"[ingest] WARNING: no team code mapping for '{full_name}' — "
+          f"odds for this game may not match to a stored game_id. "
+          f"Add it to _TEAM_NAME_TO_CODE in pipeline/ingest.py.")
+    return full_name
+
+
+def ingest_games(conn, date_str: str):
+    """
+    Sourced from MLB Stats API (clients/mlb_stats_api.py) rather than
+    SportsDataIO — see that client's module docstring for why. Team names
+    come through as full names (e.g. "New York Yankees"), same as The Odds
+    API, so _team_to_code() is used here too now — previously only needed
+    for odds matching, since SportsDataIO gave short codes directly.
+    """
+    client = MLBStatsAPIClient()
+    games = client.get_schedule(date_str)
+    count = 0
+    for g in games:
+        home_name = g.get("teams", {}).get("home", {}).get("team", {}).get("name")
+        away_name = g.get("teams", {}).get("away", {}).get("team", {}).get("name")
+        if not home_name or not away_name:
+            continue  # malformed entry — skip rather than crash the run
+
+        row = {
+            "game_id": str(g["gamePk"]),
+            "date": date_str,
+            "home_team": _team_to_code(home_name),
+            "away_team": _team_to_code(away_name),
+            "stadium": g.get("venue", {}).get("name"),
+            "weather_temp": None,
+            "weather_wind_speed": None,
+            "weather_wind_direction": None,
+            "weather_precipitation": None,
+            "status": g.get("status", {}).get("detailedState", "scheduled").lower(),
+        }
+        upsert(conn, "games", row, conflict_keys=["game_id"])
+        count += 1
+    print(f"[ingest] Upserted {count} games for {date_str}")
+    return games
+
+
+def ingest_weather(conn, games, date_str: str):
+    wclient = WeatherClient()
+    count = 0
+    for g in games:
+        game_id = str(g["gamePk"])
+        stadium = g.get("venue", {}).get("name")
+        weather = wclient.get_weather_for_stadium(stadium, date_str)
+        conn.execute(
+            """UPDATE games SET weather_temp=?, weather_wind_speed=?,
+               weather_wind_direction=?, weather_precipitation=?,
+               updated_at=datetime('now') WHERE game_id=?""",
+            (
+                weather["weather_temp"],
+                weather["weather_wind_speed"],
+                weather["weather_wind_direction"],
+                weather["weather_precipitation"],
+                game_id,
+            ),
+        )
+        count += 1
+    print(f"[ingest] Updated weather for {count} games")
+
+
+def _build_era_lookup(season: str):
+    """
+    ERA and games/starters all now come from the same source (MLB Stats
+    API) rather than mixing SportsDataIO + ESPN. See
+    clients/mlb_stats_api.py's module docstring for why SportsDataIO was
+    dropped for this (its free trial scrambles stats by 5-20% from the
+    real value, confirmed via their own support docs — schedules/teams/
+    players are fine, but ERA specifically would have been fake).
+
+    Keyed by normalize_name() (clients/name_utils.py), since the schedule
+    endpoint's probable-pitcher names and the stats endpoint's player
+    names could differ in minor formatting even within the same provider.
+    """
+    return MLBStatsAPIClient().get_pitching_era_lookup(season)
+
+
+def ingest_starters(conn, date_str: str, games: list = None):
+    """
+    Probable starting pitcher (name + MLB player ID) comes directly off
+    the schedule response's teams.home/away.probablePitcher, via the
+    'probablePitcher' hydrate parameter — no separate call needed. Not
+    every game has a probable pitcher announced yet when this runs early
+    in the day; that's normal (teams typically confirm starters a few
+    hours before first pitch), not an error, so games without one are
+    simply skipped rather than flagged as broken.
+
+    ERA is a separate lookup by normalized name against MLB's own stats
+    endpoint (see _build_era_lookup) — real, unscrambled numbers.
+    """
+    if games is None:
+        games = MLBStatsAPIClient().get_schedule(date_str)
+
+    season = date_str[:4]
+    era_lookup = _build_era_lookup(season)
+
+    count = 0
+    no_probable_pitcher = 0
+    unmatched_era_names = []
+    for g in games:
+        home_pitcher = g.get("teams", {}).get("home", {}).get("probablePitcher") or {}
+        away_pitcher = g.get("teams", {}).get("away", {}).get("probablePitcher") or {}
+        home_name = home_pitcher.get("fullName")
+        away_name = away_pitcher.get("fullName")
+
+        if not home_name and not away_name:
+            no_probable_pitcher += 1
+            continue  # not yet announced — normal, especially early in the day
+
+        home_era = era_lookup.get(normalize_name(home_name)) if home_name else None
+        away_era = era_lookup.get(normalize_name(away_name)) if away_name else None
+        if home_name and home_era is None:
+            unmatched_era_names.append(home_name)
+        if away_name and away_era is None:
+            unmatched_era_names.append(away_name)
+
+        row = {
+            "game_id": str(g["gamePk"]),
+            "home_pitcher_name": home_name,
+            "away_pitcher_name": away_name,
+            "home_ERA": home_era,
+            "away_ERA": away_era,
+            # No separate xERA source yet — using ERA as the working proxy.
+            "home_xERA": home_era,
+            "away_xERA": away_era,
+            "home_days_rest": None,   # not sourced from MLB Stats API yet
+            "away_days_rest": None,   # (would need an extra per-team call)
+            "pitch_count_last_start_home": None,
+            "pitch_count_last_start_away": None,
+        }
+        upsert(conn, "starters", row, conflict_keys=["game_id"])
+        count += 1
+
+    era_note = "" if era_lookup else " (ERA lookup returned empty — check diagnostic above if shown)"
+    print(f"[ingest] Upserted {count} starter rows for {date_str}{era_note}")
+    if no_probable_pitcher:
+        print(f"[ingest] NOTE: {no_probable_pitcher} game(s) had no probable pitcher announced yet "
+              f"(normal if running early in the day — try again closer to game time, e.g. via "
+              f"the 'closing' step).")
+    if unmatched_era_names:
+        print(f"[ingest] ERA lookup contains {len(era_lookup)} pitchers total. "
+              f"{len(unmatched_era_names)} starter(s) had no match:")
+        import difflib
+        lookup_keys = list(era_lookup.keys())
+        for name in unmatched_era_names:
+            key = normalize_name(name)
+            close = difflib.get_close_matches(key, lookup_keys, n=1, cutoff=0.6)
+            if close:
+                print(f"    - {name!r} (normalized: {key!r}) — no exact match, but close candidate "
+                      f"in lookup: {close[0]!r}. Likely a formatting difference, not a missing pitcher.")
+            else:
+                print(f"    - {name!r} (normalized: {key!r}) — no match and no close candidate found "
+                      f"at all. Either genuinely not in this season's pitching stats yet, or the "
+                      f"lookup is incomplete.")
+    return count
+
+
+def _commence_time_to_et_date(commence_time_iso: str) -> str:
+    """
+    Approximates the US-Eastern 'baseball day' a game belongs to. The Odds
+    API returns commence_time in UTC, and a typical evening ET first pitch
+    (e.g. 10:05pm ET) lands after midnight UTC — technically the next
+    calendar day in raw UTC terms, but still "today" in the sense MLB
+    schedules and SportsDataIO's Day field use. Uses a fixed UTC-4 (EDT)
+    offset rather than full timezone/DST handling — safe here since the
+    entire MLB season falls within US daylight saving time.
+    """
+    from datetime import datetime, timedelta
+    dt_utc = datetime.strptime(commence_time_iso, "%Y-%m-%dT%H:%M:%SZ")
+    dt_et = dt_utc - timedelta(hours=4)
+    return dt_et.date().isoformat()
+
+
+def _has_game_started(commence_time_iso: str) -> bool:
+    """True if commence_time is at or before the current UTC time."""
+    from datetime import datetime, timezone
+    try:
+        commence_dt = datetime.strptime(commence_time_iso, "%Y-%m-%dT%H:%M:%SZ")
+    except ValueError:
+        return False  # malformed timestamp — treat as not-yet-started rather than silently drop the event
+    now_utc_naive = datetime.now(timezone.utc).replace(tzinfo=None)
+    return commence_dt <= now_utc_naive
+
+
+def _find_game_id_by_teams(conn, home_team_full, away_team_full, date_str):
+    """
+    Match Odds API's full team names back to our game_id via the games
+    table — scoped to date_str. This used to search the ENTIRE games
+    table with no date filter, which is a real bug: if the table has more
+    than one row for the same home team (e.g. a leftover mock-mode game
+    plus a real game on a different day), it could silently attach live
+    odds to the wrong stored game. Always filtering by date_str first
+    closes that; the fallback to an undated search below only exists for
+    the genuine date-boundary edge case and is logged when it fires, since
+    silently falling back to "any date" is exactly the behavior that
+    caused the bug in the first place.
+    """
+    home_code = _team_to_code(home_team_full)
+    row = conn.execute(
+        "SELECT game_id FROM games WHERE date=? AND (home_team=? OR home_team=?)",
+        (date_str, home_code, home_team_full),
+    ).fetchone()
+    if row:
+        return row["game_id"]
+
+    # No match on the exact date — only reachable for genuine day-boundary
+    # edge cases the ET conversion above didn't already catch. Falling back
+    # to an undated search here (rather than just returning None) trades a
+    # small re-introduction of the old risk for not missing a legitimate
+    # match; logged explicitly so it's never silent.
+    row = conn.execute(
+        "SELECT game_id, date FROM games WHERE home_team=? OR home_team=?",
+        (home_code, home_team_full),
+    ).fetchone()
+    if row:
+        print(f"[ingest] NOTE: matched {away_team_full} @ {home_team_full} to a stored game "
+              f"on {row['date']}, not the requested {date_str} — verify this is the right game, "
+              f"not a leftover from a different run (e.g. old mock-mode data).")
+        return row["game_id"]
+    return None
+
+
+def _fetch_current_odds_with_fallback():
+    """
+    Returns (events, source_used) where source_used is "odds_api",
+    "parlay_api", or "sharpapi", per config.ODDS_SOURCE:
+
+      "odds_api"   - The Odds API only, no fallback. Raises on failure,
+                     same as the old behavior.
+      "parlay_api" - ParlayAPI only, The Odds API is never called.
+      "sharpapi"   - SharpAPI only.
+      "auto"       (default) - try The Odds API first; if that fails, try
+                     ParlayAPI; if that ALSO fails (returns no events),
+                     try SharpAPI. Any failure is logged with which source
+                     it fell back from/to. Deliberately broad rather than
+                     special-casing "credits exhausted" vs other failures
+                     — from the caller's perspective any failure just
+                     means "no live odds from this source right now."
+
+    Note: ParlayAPIClient and SharpAPIClient both have their own error
+    handling (see clients/parlay_api.py, clients/sharpapi.py) and return
+    [] rather than raising on failure, so if ALL THREE sources are down,
+    this returns an empty list rather than crashing the whole ingest run.
+    """
+    source = config.ODDS_SOURCE
+
+    if source == "parlay_api":
+        return ParlayAPIClient().get_current_odds(), "parlay_api"
+    if source == "sharpapi":
+        return SharpAPIClient().get_current_odds(), "sharpapi"
+    if source == "odds_api":
+        return OddsAPIClient().get_current_odds(), "odds_api"
+
+    # "auto" (default): Odds API -> ParlayAPI -> SharpAPI.
+    try:
+        events = OddsAPIClient().get_current_odds()
+        return events, "odds_api"
+    except requests.exceptions.RequestException as e:
+        status = getattr(getattr(e, "response", None), "status_code", None)
+        reason = f"HTTP {status}" if status else str(e)
+        print(f"[ingest] WARNING: The Odds API call failed ({reason}) — "
+              f"likely out of credits or a bad/expired key. Falling back "
+              f"to ParlayAPI for this run.")
+
+    events = ParlayAPIClient().get_current_odds()
+    if events:
+        return events, "parlay_api"
+
+    print("[ingest] WARNING: ParlayAPI returned no events either — "
+          "falling back to SharpAPI for this run.")
+    return SharpAPIClient().get_current_odds(), "sharpapi"
+
+
+def ingest_odds(conn, date_str: str, snapshot: str):
+    """
+    snapshot: 'opening' or 'closing'. Determines which columns get written.
+
+    Correction from an earlier assumption: The Odds API's docs confirm the
+    /odds endpoint keeps returning a game after it goes live ("returns
+    upcoming, live and recently completed games... finished events roll
+    off") — it does NOT stop at first pitch. That matters here because a
+    live game's moneyline reflects in-play win probability (shifts with
+    the score), not pregame closing sentiment. If a scheduled 'closing'
+    run fires after a game has already started, blindly writing whatever
+    the API returns would silently overwrite a correct closing line with
+    a contaminated in-play number — corrupting CLV, the metric the
+    qualification policy treats as more trustworthy than raw ROI. So this
+    function explicitly skips any event whose commence_time has already
+    passed when snapshot='closing', rather than relying on the API to stop
+    returning it. The last successful write before a game's actual start
+    is what ends up as its closing line.
+    """
+    assert snapshot in ("opening", "closing")
+    events, source_used = _fetch_current_odds_with_fallback()
+    print(f"[ingest] odds source for this run: {source_used}")
+    count = 0
+    unmatched = []
+    skipped_other_day = 0
+    skipped_already_started = 0
+    for event in events:
+        commence_time = event.get("commence_time")
+        if commence_time:
+            event_et_date = _commence_time_to_et_date(commence_time)
+            if event_et_date != date_str:
+                # A different baseball day than the one being ingested —
+                # The Odds API returns the full upcoming slate, not just
+                # today's, so this is expected and not worth warning about.
+                skipped_other_day += 1
+                continue
+
+            if snapshot == "closing" and _has_game_started(commence_time):
+                # Already live — writing now would contaminate the closing
+                # line with in-play pricing. Leave whatever was captured
+                # on the last pre-start run as the final closing value.
+                skipped_already_started += 1
+                continue
+
+        game_id = _find_game_id_by_teams(conn, event["home_team"], event["away_team"], date_str)
+        if not game_id:
+            # Same baseball day per commence_time, but still no matching
+            # stored game — now this really is likely a team-code mismatch
+            # worth surfacing, not a date artifact.
+            unmatched.append(f"{event['away_team']} @ {event['home_team']}")
+            continue
+
+        for bookmaker in event.get("bookmakers", []):
+            book_key = bookmaker["key"]
+            ml_home = ml_away = total = rl_home = rl_away = None
+            rl_home_price = rl_away_price = total_over_price = total_under_price = None
+
+            for market in bookmaker.get("markets", []):
+                if market["key"] == "h2h":
+                    for outcome in market["outcomes"]:
+                        if outcome["name"] == event["home_team"]:
+                            ml_home = outcome["price"]
+                        elif outcome["name"] == event["away_team"]:
+                            ml_away = outcome["price"]
+                elif market["key"] == "totals":
+                    for outcome in market["outcomes"]:
+                        total = outcome.get("point", total)
+                        if outcome["name"] == "Over":
+                            total_over_price = outcome["price"]
+                        elif outcome["name"] == "Under":
+                            total_under_price = outcome["price"]
+                elif market["key"] == "spreads":
+                    for outcome in market["outcomes"]:
+                        if outcome["name"] == event["home_team"]:
+                            rl_home = outcome.get("point")
+                            rl_home_price = outcome["price"]
+                        elif outcome["name"] == event["away_team"]:
+                            rl_away = outcome.get("point")
+                            rl_away_price = outcome["price"]
+
+            prefix = snapshot  # 'opening' or 'closing'
+            row = {
+                "game_id": game_id,
+                "sportsbook": book_key,
+                f"{prefix}_moneyline_home": ml_home,
+                f"{prefix}_moneyline_away": ml_away,
+                f"{prefix}_runline_home": rl_home,
+                f"{prefix}_runline_home_price": rl_home_price,
+                f"{prefix}_runline_away": rl_away,
+                f"{prefix}_runline_away_price": rl_away_price,
+                f"{prefix}_total": total,
+                f"{prefix}_total_over_price": total_over_price,
+                f"{prefix}_total_under_price": total_under_price,
+            }
+            # Upsert only touches the columns relevant to this snapshot;
+            # the other snapshot's columns are preserved via ON CONFLICT
+            # partial update (upsert() only sets columns present in `row`).
+            upsert(conn, "odds", row, conflict_keys=["game_id", "sportsbook"])
+            count += 1
+    print(f"[ingest] Upserted {count} odds rows ({snapshot} snapshot) for {date_str}")
+    if skipped_other_day:
+        print(f"[ingest] Skipped {skipped_other_day} event(s) from {source_used} belonging to a "
+              f"different day ({source_used} returns the full upcoming slate, not just {date_str}).")
+    if skipped_already_started:
+        print(f"[ingest] Skipped {skipped_already_started} event(s) that have already started — "
+              f"their closing line was already captured on an earlier run and is left as-is, "
+              f"rather than overwritten with in-play pricing. Normal on later runs of the day.")
+    if unmatched:
+        print(f"[ingest] WARNING: {len(unmatched)} game(s) on {date_str}'s slate from {source_used} "
+              f"could not be matched to a stored game_id — this is now most likely a genuine "
+              f"team-name mismatch (check _team_to_code() in this file), since date-boundary "
+              f"mismatches are filtered out above:")
+        for m in unmatched:
+            print(f"    - {m}")
+
+    # Games with NO odds row at all yet (not "unmatched" — those are events
+    # the source returned but couldn't be matched to a stored game_id; this
+    # is the opposite case: stored games the source's response didn't
+    # contain any event for, at all). Distinguishing these matters because
+    # they have very different causes: "unmatched" points at a team-name
+    # bug in this file, while "no coverage yet" more often just means the
+    # sportsbooks in this source haven't posted a line for that game yet
+    # (common for the day's latest-starting games on an early "opening"
+    # run) — a later run, not a code fix, is what resolves it.
+    uncovered = conn.execute(
+        """
+        SELECT g.game_id, g.home_team, g.away_team FROM games g
+        WHERE g.date = ?
+          AND NOT EXISTS (SELECT 1 FROM odds o WHERE o.game_id = g.game_id)
+        ORDER BY g.game_id
+        """,
+        (date_str,),
+    ).fetchall()
+    if uncovered:
+        print(f"[ingest] NOTE: {len(uncovered)} game(s) on {date_str} still have NO odds row from "
+              f"ANY source/run so far (not necessarily a bug — often just means the sportsbooks "
+              f"haven't posted a line for that game yet, common for the day's later-starting "
+              f"games on an early run). Re-run ingest closer to those games' first pitch to check "
+              f"again:")
+        for row in uncovered:
+            print(f"    - {row['away_team']} @ {row['home_team']} ({row['game_id']})")
+
+
+
+def run(date_str: str, snapshot: str):
+    init_db()  # safe no-op if tables already exist
+    with connection() as conn:
+        games = ingest_games(conn, date_str)
+        ingest_weather(conn, games, date_str)
+        ingest_starters(conn, date_str, games=games)
+        ingest_odds(conn, date_str, snapshot)
+    print(f"[ingest] Done: {date_str} ({snapshot})")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Ingest daily MLB games/odds/starters/weather")
+    parser.add_argument("--date", default=_date.today().isoformat(), help="YYYY-MM-DD")
+    parser.add_argument("--snapshot", choices=["opening", "closing"], default="opening")
+    args = parser.parse_args()
+    run(args.date, args.snapshot)

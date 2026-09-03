@@ -1,0 +1,98 @@
+# MLB Edge Lab Orchestrator — Stage Configuration
+#
+# Two trigger types:
+#   daily_time   — fires once per calendar day at a fixed local time.
+#                  Used for the "discover today's games" stage, since that
+#                  has no game to offset against yet.
+#   game_offset  — fires N minutes before a specific game's first pitch.
+#                  Requires games.game_time_utc to be populated (see the
+#                  ingest_games patch — this column doesn't exist until
+#                  you apply it).
+#
+# handler must match a key in orchestrator/stage_registry.py:HANDLERS.
+# Adding a new stage = add an entry here + a handler function. The
+# scheduler never needs to change.
+
+stages:
+  - name: daily_schedule_sync
+    trigger:
+      type: daily_time
+      at: "06:00"          # local time, HH:MM, 24h
+    handler: sync_daily_schedule
+    retry:
+      enabled: true
+      attempts: 5
+
+  - name: initial_market_snapshot
+    trigger:
+      type: game_offset
+      minutes_before_start: 240
+    handler: odds_opening_snapshot
+    retry:
+      enabled: true
+      attempts: 5
+
+  - name: starter_confirmation
+    trigger:
+      type: game_offset
+      minutes_before_start: 180
+    handler: starter_refresh
+    retry:
+      enabled: true
+      attempts: 5
+
+  - name: weather_refresh
+    trigger:
+      type: game_offset
+      minutes_before_start: 120
+    handler: weather_refresh
+    retry:
+      enabled: true
+      attempts: 3
+
+  - name: market_update
+    trigger:
+      type: game_offset
+      minutes_before_start: 60
+    handler: odds_opening_snapshot
+    retry:
+      enabled: true
+      attempts: 5
+
+  - name: edge_computation
+    trigger:
+      type: game_offset
+      minutes_before_start: 55        # trails market_update (60) so it always
+    handler: compute_edges            # scores against a fresh odds snapshot
+    retry:
+      enabled: true
+      attempts: 3
+
+  - name: final_starter_check
+    trigger:
+      type: game_offset
+      minutes_before_start: 15
+    handler: starter_refresh
+    retry:
+      enabled: true
+      attempts: 3
+
+  - name: edge_recomputation_final
+    trigger:
+      type: game_offset
+      minutes_before_start: 10        # trails final_starter_check (15) so a
+    handler: compute_edges            # late scratch is reflected before first pitch
+    retry:
+      enabled: true
+      attempts: 3
+
+  - name: closing_snapshot
+    trigger:
+      type: game_offset
+      minutes_before_start: 5
+    handler: odds_closing_snapshot
+    retry:
+      enabled: true
+      attempts: 5
+
+poll_interval_seconds: 60
